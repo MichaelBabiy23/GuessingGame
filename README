@@ -1,0 +1,87 @@
+# Guess the Number Game Server
+
+This project implements a simple multiplayer "Guess the Number" game server using TCP and the `select()` system call. The server handles multiple players concurrently on non-blocking sockets and maintains a simple game state. Players connect via Telnet and send numeric guesses. The server broadcasts each guess and provides feedback—indicating whether the guess is too high or too low. When a player guesses correctly, the server announces the winner, informs everyone of the correct number, closes all connections, and starts a new game.
+
+## File Structure
+
+- **gameServer.c**
+  Contains the `main(int argc, char *argv[])` function and implements the server logic:
+  1. Validates command-line arguments (`port`, `seed`, and `max-number-of-players`).
+  2. Creates a non-blocking welcome (listening) socket.
+  3. Uses `select()` to multiplex I/O across the welcome socket and all client sockets.
+  4. Accepts new client connections, assigns a unique player id, and sends welcome/join messages.
+  5. Reads players’ guesses, broadcasts them, and sends appropriate feedback ("too high", "too low").
+  6. Handles correct guesses by announcing the winner, closing all connections, and restarting the game.
+  7. Manages client disconnections and cleans up resources on shutdown (e.g., on CTRL-C).
+
+## Compilation
+
+Compile the server with a C compiler. For example:
+
+```bash
+gcc -Wall -Wextra -o server gameServer.c
+```
+
+This will produce an executable named **`server`**.
+
+## Usage
+
+Run the server with:
+
+```bash
+./server <port> <seed> <max-number-of-players>
+```
+
+Example:
+
+```bash
+./server 12345 42 5
+```
+
+Where:
+- **`port`**: The port on which the server listens (e.g., 12345).
+- **`seed`**: An integer seed for the random number generator (used to generate the target number).
+- **`max-number-of-players`**: Maximum number of concurrent players that can join the game.
+
+## Features
+
+1. **Non-blocking I/O with select()**
+   - The server uses a single call to `select()` in each iteration to monitor the welcome socket and client sockets for both reading and writing.
+   - Avoids busy waiting by checking socket readiness before any I/O operation.
+
+2. **Dynamic Player Management**
+   - Assigns unique ids to players when they connect.
+   - Notifies existing players when a new player joins or when a player disconnects.
+
+3. **Guessing Mechanics**
+   - Broadcasts each player’s guess to all connected clients.
+   - Provides immediate feedback if the guess is too high or too low.
+   - On a correct guess, announces the winner and the correct number to all players, then resets the game.
+
+4. **Graceful Shutdown**
+   - Catches CTRL-C (SIGINT) to free all resources and close all sockets properly.
+
+## Example Usage with Telnet
+
+After starting the server:
+
+```bash
+./server 12345 42 5
+```
+
+Open multiple terminal windows and connect as players using:
+
+```bash
+telnet localhost 12345
+```
+
+Each connected player will receive a welcome message with their unique id. Players then submit numeric guesses to participate in the game.
+
+## Known Limitations
+
+- The server is single-threaded and relies solely on non-blocking I/O with `select()`.
+- The game logic assumes that each client sends one complete guess per message.
+- The server prints debugging messages (e.g., socket readiness logs) on each select iteration—ensure these do not flood your console during production use.
+- Only minimal error handling is implemented; additional robustness may be required for production environments.
+
+Happy gaming and good luck guessing the number!

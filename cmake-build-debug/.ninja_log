@@ -1,0 +1,7 @@
+# ninja log v6
+123	167	1742127668622864802	GuessingGame	c388974af58a9329
+1	123	1742127668498857412	CMakeFiles/GuessingGame.dir/gameServer.c.o	b19490abfc960b9f
+3	99	1742127639597157435	CMakeFiles/GuessingGame.dir/main.c.o	9210d5dc361dd809
+0	112	1742127670162956647	build.ninja	bf8a5fd5b7379ab
+14	527	1742415940219627674	CMakeFiles/GuessingGame.dir/gameServer.c.o	b19490abfc960b9f
+527	599	1742415940732431451	GuessingGame	c388974af58a9329

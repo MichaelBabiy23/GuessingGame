@@ -1,0 +1,3 @@
+/home/parallels/CLionProjects/GuessingGame/cmake-build-debug/CMakeFiles/GuessingGame.dir
+/home/parallels/CLionProjects/GuessingGame/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/parallels/CLionProjects/GuessingGame/cmake-build-debug/CMakeFiles/rebuild_cache.dir
