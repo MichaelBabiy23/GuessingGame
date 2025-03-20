@@ -26,11 +26,11 @@
 typedef struct message {
     char *text;          /* Full message text */
     int length;          /* Total length in bytes */
-    int sent_offset;     /* How many bytes have been sent already */
+    int sent_offset;     /* Number of bytes already sent */
     struct message *next;
 } message_t;
 
-/* A connected client/player. */
+/* Represents a connected client/player. */
 typedef struct client {
     int fd;
     int id;
@@ -346,7 +346,7 @@ void accept_new_connection(void) {
     socklen_t addrlen = sizeof(caddr);
     int new_fd = accept(server_fd, (struct sockaddr *)&caddr, &addrlen);
     if (new_fd >= 0) {
-        printf("Server is ready to read from welcome socket %d\n", server_fd);
+        /* Removed duplicate print here; main loop prints readiness for welcome socket */
         set_socket_nonblocking(new_fd);
         int new_id = get_available_client_id();
         if (new_id == -1) {
@@ -368,7 +368,7 @@ void accept_new_connection(void) {
 }
 
 void read_from_client(client_t *client) {
-    printf("Server is ready to read from player %d on socket %d\n", client->id, client->fd);
+    /* Removed duplicate print; main loop handles readiness message */
     char buf[512];
     int bytes = recv(client->fd, buf, sizeof(buf), 0);
     if (bytes <= 0) {
@@ -382,7 +382,7 @@ void read_from_client(client_t *client) {
 void write_to_client(client_t *client) {
     if (!client->msg_head)
         return;
-    printf("Server is ready to write to player %d on socket %d\n", client->id, client->fd);
+    /* Removed duplicate print; main loop handles readiness message */
     message_t *msg = client->msg_head;
     int remaining = msg->length - msg->sent_offset;
     int sent = send(client->fd, msg->text + msg->sent_offset, remaining, 0);
@@ -404,7 +404,7 @@ void write_to_client(client_t *client) {
 
 /*
  * If game_over is set, check if all outgoing queues are empty.
- * Once all messages are sent, close all client sockets, free them, and start a new game.
+ * Once they are empty, close all client sockets, free them, and start a new game.
  */
 void check_if_all_messages_sent(void) {
     if (!game_over)
@@ -412,7 +412,7 @@ void check_if_all_messages_sent(void) {
     client_t *c = clients;
     while (c) {
         if (c->msg_head)
-            return;  /* Some messages still pending */
+            return;  /* Still pending messages */
         c = c->next;
     }
     /* All messages have been sent. Close all client connections and free them. */
