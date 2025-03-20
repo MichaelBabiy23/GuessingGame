@@ -1,8 +1,8 @@
 /*
- * gameServer.c - "Guess the Number" game server
  * Usage: ./game_server <port> <seed> <max-number-of-players>
- */
-
+ * Example: ./game_server 5000 42 4
+ *
+*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,15 +20,15 @@
 #define INITIAL_BUFFER_SIZE 1024
 #define TARGET_RANGE 100
 
-/* ----- Data Structures ----- */
-
+/* Each queued message is a single line, possibly partial-sent. */
 typedef struct message {
-    char *text;           /* The complete message, ending with \n */
-    int length;           /* Total length in bytes */
-    int sent_offset;      /* How many bytes have been sent so far */
+    char *text;          /* Full line ending with '\n' */
+    int length;          /* Total length of this line */
+    int sent_offset;     /* How many bytes have been sent so far */
     struct message *next;
 } message_t;
 
+/* One connected client/player. */
 typedef struct client {
     int fd;
     int id;
@@ -40,19 +40,15 @@ typedef struct client {
     struct client *next;
 } client_t;
 
-/* ----- Globals ----- */
-
 int server_fd = -1;
 client_t *clients = NULL;
 int max_players = 0;
 int current_target = 0;
 int port = 0;
 sig_atomic_t exit_requested = 0;
+int game_over = 0;  /* 1 if a player guessed correctly; we wait to flush messages. */
 
-int game_over = 0;
-
-/* ----- Prototypes ----- */
-
+/* Prototypes */
 void sigint_handler(int sig);
 void init_signal_handler(void);
 void usage_and_exit(void);
@@ -92,7 +88,7 @@ void init_signal_handler(void) {
     }
 }
 
-/* ----- Usage and Argument Parsing ----- */
+/* ----- Usage & Arguments ----- */
 
 void usage_and_exit(void) {
     fprintf(stderr, "Usage: ./game_server <port> <seed> <max-number-of-players>\n");
@@ -103,6 +99,7 @@ void parse_arguments(int argc, char *argv[]) {
     if (argc != 4) {
         usage_and_exit();
     }
+
     char *endptr = NULL;
 
     long port_val = strtol(argv[1], &endptr, 10);
@@ -203,6 +200,7 @@ void add_client(client_t *client) {
     clients = client;
 }
 
+/* Remove a client, broadcast a "disconnected" message, free resources. */
 void remove_client(client_t *client) {
     char msg[128];
     snprintf(msg, sizeof(msg), "Player %d disconnected\n", client->id);
@@ -230,6 +228,7 @@ void remove_client(client_t *client) {
     free(client);
 }
 
+/* Returns an unused ID in [1..max_players], or -1 if none available. */
 int get_available_client_id(void) {
     int used[max_players + 1];
     memset(used, 0, sizeof(used));
@@ -245,8 +244,9 @@ int get_available_client_id(void) {
     return -1;
 }
 
-/* ----- Message Queue Helpers ----- */
+/* ----- Message Queue ----- */
 
+/* Enqueue a single line to the client's outgoing queue. */
 void enqueue_message(client_t *client, const char *text) {
     message_t *msg = malloc(sizeof(message_t));
     if (!msg) {
@@ -270,6 +270,7 @@ void enqueue_message(client_t *client, const char *text) {
     client->msg_tail = msg;
 }
 
+/* Broadcast one line to all clients except optionally skip one. */
 void broadcast_message(const char *text, client_t *skip) {
     client_t *cur = clients;
     while (cur) {
@@ -279,8 +280,9 @@ void broadcast_message(const char *text, client_t *skip) {
     }
 }
 
-/* ----- Buffer and Message Processing ----- */
+/* ----- Buffer + Message Processing ----- */
 
+/* Expand the client's buffer if needed, then append new data. */
 void append_to_client_buffer(client_t *client, const char *data, int len) {
     if (client->in_buffer_size + len > client->in_buffer_capacity) {
         int new_cap = client->in_buffer_capacity * 2;
@@ -298,6 +300,11 @@ void append_to_client_buffer(client_t *client, const char *data, int len) {
     client->in_buffer_size += len;
 }
 
+/*
+ * Process each complete line in the buffer (ending with '\n').
+ * "quit" => remove client
+ * numeric => interpret as guess
+ */
 void process_client_messages(client_t *client) {
     int start = 0;
     for (int i = 0; i < client->in_buffer_size; i++) {
@@ -345,8 +352,9 @@ void process_client_messages(client_t *client) {
         }
     }
     if (start > 0) {
-        if (start < client->in_buffer_size)
+        if (start < client->in_buffer_size) {
             memmove(client->in_buffer, client->in_buffer + start, client->in_buffer_size - start);
+        }
         client->in_buffer_size -= start;
     }
 }
@@ -358,7 +366,8 @@ void accept_new_connection(void) {
     socklen_t addrlen = sizeof(caddr);
     int new_fd = accept(server_fd, (struct sockaddr *)&caddr, &addrlen);
     if (new_fd >= 0) {
-        printf("Server is ready to read from welcome socket %d\n", server_fd);
+        /* The assignment wants the print in the main loop, not here,
+           but we can accept the connection now that FD_ISSET told us so. */
         set_socket_nonblocking(new_fd);
         int new_id = get_available_client_id();
         if (new_id == -1) {
@@ -381,7 +390,6 @@ void accept_new_connection(void) {
 }
 
 void read_from_client(client_t *client) {
-    printf("Server is ready to read from player %d on socket %d\n", client->id, client->fd);
     char buf[512];
     int bytes = recv(client->fd, buf, sizeof(buf), 0);
     if (bytes <= 0) {
@@ -392,10 +400,13 @@ void read_from_client(client_t *client) {
     }
 }
 
+/*
+ * Send one message from the queue. If partial write occurs, we'll finish
+ * in subsequent calls. If fully sent, dequeue it.
+ */
 void write_to_client(client_t *client) {
     if (!client->msg_head) return;
 
-    printf("Server is ready to write to player %d on socket %d\n", client->id, client->fd);
     message_t *msg = client->msg_head;
     int remaining = msg->length - msg->sent_offset;
     int sent = send(client->fd, msg->text + msg->sent_offset, remaining, 0);
@@ -416,19 +427,20 @@ void write_to_client(client_t *client) {
 }
 
 /*
- * If the game ended (someone guessed correctly), we check if
- * all outgoing queues are empty. If so, we close all clients
- * and start a new game.
+ * If game_over == 1, check if all queues are empty. If so,
+ * close all client sockets, free them, start a new game.
  */
 void check_if_all_messages_sent(void) {
     if (!game_over) return;
+
     client_t *c = clients;
     while (c) {
         if (c->msg_head) {
-            return;
+            return; /* Not all messages sent yet */
         }
         c = c->next;
     }
+    /* All messages have been sent. Close all. */
     c = clients;
     while (c) {
         close(c->fd);
@@ -450,6 +462,7 @@ void check_if_all_messages_sent(void) {
     start_new_game();
 }
 
+/* Reset target and game_over, allowing new players to join fresh. */
 void start_new_game(void) {
     current_target = (rand() % TARGET_RANGE) + 1;
     game_over = 0;
@@ -527,25 +540,29 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
 
+        /* If the welcome socket is ready to read, accept new connection. */
         if (FD_ISSET(server_fd, &read_set)) {
-            /* The welcome socket is ready to read (accept a new connection). */
-            /* We'll print "Server is ready to read from welcome socket" inside accept_new_connection(). */
+            printf("Server is ready to read from welcome socket %d\n", server_fd);
             accept_new_connection();
         }
 
+        /* For each client that is readable, handle reading. */
         c = clients;
         while (c) {
             client_t *next = c->next;
             if (FD_ISSET(c->fd, &read_set)) {
+                printf("Server is ready to read from player %d on socket %d\n", c->id, c->fd);
                 read_from_client(c);
             }
             c = next;
         }
 
+        /* For each client that is writable, handle writing. */
         c = clients;
         while (c) {
             client_t *next = c->next;
             if (FD_ISSET(c->fd, &write_set) && c->msg_head) {
+                printf("Server is ready to write to player %d on socket %d\n", c->id, c->fd);
                 write_to_client(c);
             }
             c = next;
