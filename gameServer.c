@@ -1,13 +1,5 @@
 /*
  * gameServer.c - "Guess the Number" game server
- *
- * - Validates usage arguments: <port> <seed> <max-number-of-players>
- * - Non-blocking sockets, single select() call per loop
- * - Prints readiness messages whenever a socket is ready for read/write
- * - Sends one line per write event (partial write handling with offset)
- * - Closes connections only after all messages (including winning lines) are sent
- * - Frees all resources properly
- *
  * Usage: ./game_server <port> <seed> <max-number-of-players>
  */
 
@@ -57,10 +49,6 @@ int current_target = 0;
 int port = 0;
 sig_atomic_t exit_requested = 0;
 
-/*
- * game_over indicates that someone has guessed correctly. We don't close
- * connections immediately; we wait until all queued messages are fully sent.
- */
 int game_over = 0;
 
 /* ----- Prototypes ----- */
