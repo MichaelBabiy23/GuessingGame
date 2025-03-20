@@ -1,7 +1,7 @@
-/* gameServer.c - "Guess the Number" game server
- *
- * Usage: ./server <port> <seed> <max-number-of-players>
- * Compile with: gcc -Wall -Wextra -o server gameServer.c
+/*
+ * Usage: ./game_server <port> <seed> <max-number-of-players>
+ * Example: ./game_server 5000 42 4
+ * Compile with: gcc -Wall -Wextra -o game_server gameServer.c
  */
 
 #include <stdio.h>
@@ -11,52 +11,44 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 
+/* Constants */
 #define INITIAL_BUFFER_SIZE 1024
 #define TARGET_RANGE 100
 
-/* Function prototypes */
-void sigint_handler(int sig);
-void init_signal_handler(void);
-void set_socket_nonblocking(int fd);
-int create_listening_socket(int port);
-struct client *create_client(int fd, int id);
-void add_client(struct client *client);
-void remove_client(struct client *client);
-int get_available_client_id(void);
-void enqueue_message(struct client *client, const char *text);
-struct message *dequeue_message(struct client *client);
-void broadcast_message(const char *text, struct client *skip_client);
-void append_to_client_buffer(struct client *client, const char *data, int len);
-void process_client_messages(struct client *client);
-void flush_client_queues(void);
-void accept_new_connection(void);
-void read_from_client(struct client *client);
-void write_to_client(struct client *client);
-void cleanup_all(void);
+/* --- Data Structures --- */
 
-/* Data structures */
+/* Each queued message has a dynamic buffer, length, and an offset for partial writes. */
 typedef struct message {
-    char *text;
+    char *text;               /* The full message text, ending with '\n' */
+    int length;               /* Total length of the message in bytes */
+    int sent_offset;          /* How many bytes have been sent so far */
     struct message *next;
 } message_t;
 
+/* Represents one connected player (client). */
 typedef struct client {
-    int fd;
-    int id;
-    message_t *msg_head;
-    message_t *msg_tail;
-    char *in_buffer;
+    int fd;                   /* Socket descriptor */
+    int id;                   /* Unique player ID */
+
+    message_t *msg_head;      /* Head of the outgoing message queue */
+    message_t *msg_tail;      /* Tail of the outgoing message queue */
+
+    char *in_buffer;          /* Dynamic buffer for incoming data */
     int in_buffer_size;
     int in_buffer_capacity;
+
     struct client *next;
 } client_t;
 
-/* Global variables */
+/* --- Global Variables --- */
+
 int server_fd = -1;
 client_t *clients = NULL;
 int max_players = 0;
@@ -64,7 +56,37 @@ int current_target = 0;
 int port = 0;
 sig_atomic_t exit_requested = 0;
 
-/* Signal handling */
+/*
+ * When a correct guess is found, we broadcast the winning messages,
+ * then we wait until all messages in all queues are fully sent.
+ * At that point, we close all client sockets, free them, and start a new game.
+ */
+int game_over = 0;
+
+/* --- Function Prototypes --- */
+void sigint_handler(int sig);
+void init_signal_handler(void);
+void usage_and_exit(void);
+void parse_arguments(int argc, char *argv[]);
+void set_socket_nonblocking(int fd);
+int create_listening_socket(int port);
+client_t *create_client(int fd, int id);
+void add_client(client_t *client);
+void remove_client(client_t *client);
+int get_available_client_id(void);
+void enqueue_message(client_t *client, const char *text);
+void broadcast_message(const char *text, client_t *skip);
+void append_to_client_buffer(client_t *client, const char *data, int len);
+void process_client_messages(client_t *client);
+void accept_new_connection(void);
+void read_from_client(client_t *client);
+void write_to_client(client_t *client);
+void cleanup_all(void);
+void check_if_all_messages_sent(void);
+void start_new_game(void);
+
+/* --- Signal Handling --- */
+
 void sigint_handler(int sig) {
     (void)sig;
     exit_requested = 1;
@@ -73,7 +95,7 @@ void sigint_handler(int sig) {
 void init_signal_handler(void) {
     struct sigaction sa;
     sa.sa_handler = sigint_handler;
-    sa.sa_flags   = 0;
+    sa.sa_flags = 0;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGINT, &sa, NULL) == -1) {
         perror("sigaction");
@@ -81,7 +103,44 @@ void init_signal_handler(void) {
     }
 }
 
-/* Socket utility functions */
+/* --- Usage and Argument Parsing --- */
+
+void usage_and_exit(void) {
+    fprintf(stderr, "Usage: ./game_server <port> <seed> <max-number-of-players>\n");
+    exit(EXIT_FAILURE);
+}
+
+/* Safely parse arguments using strtol and validate them. */
+void parse_arguments(int argc, char *argv[]) {
+    if (argc != 4) {
+        usage_and_exit();
+    }
+
+    char *endptr = NULL;
+
+    long port_val = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || port_val < 1 || port_val > 65535) {
+        usage_and_exit();
+    }
+    port = (int)port_val;
+
+    endptr = NULL;
+    long seed_val = strtol(argv[2], &endptr, 10);
+    if (*endptr != '\0') {
+        usage_and_exit();
+    }
+    srand((unsigned)seed_val);
+
+    endptr = NULL;
+    long mp_val = strtol(argv[3], &endptr, 10);
+    if (*endptr != '\0' || mp_val < 2) {
+        usage_and_exit();
+    }
+    max_players = (int)mp_val;
+}
+
+/* --- Socket Utility Functions --- */
+
 void set_socket_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
@@ -111,9 +170,9 @@ int create_listening_socket(int port) {
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
+    addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
+    addr.sin_port = htons(port);
 
     if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
         perror("bind");
@@ -129,26 +188,27 @@ int create_listening_socket(int port) {
     return sockfd;
 }
 
-/* Client management */
+/* --- Client Management --- */
+
 client_t *create_client(int fd, int id) {
-    client_t *client = malloc(sizeof(client_t));
-    if (!client) {
+    client_t *c = malloc(sizeof(client_t));
+    if (!c) {
         perror("malloc");
         return NULL;
     }
-    client->fd = fd;
-    client->id = id;
-    client->msg_head = client->msg_tail = NULL;
-    client->in_buffer_capacity = INITIAL_BUFFER_SIZE;
-    client->in_buffer = malloc(client->in_buffer_capacity);
-    if (!client->in_buffer) {
+    c->fd = fd;
+    c->id = id;
+    c->msg_head = c->msg_tail = NULL;
+    c->in_buffer_capacity = INITIAL_BUFFER_SIZE;
+    c->in_buffer = malloc(c->in_buffer_capacity);
+    if (!c->in_buffer) {
         perror("malloc");
-        free(client);
+        free(c);
         return NULL;
     }
-    client->in_buffer_size = 0;
-    client->next = NULL;
-    return client;
+    c->in_buffer_size = 0;
+    c->next = NULL;
+    return c;
 }
 
 void add_client(client_t *client) {
@@ -156,14 +216,15 @@ void add_client(client_t *client) {
     clients = client;
 }
 
+/* Removes the client, broadcasts a disconnect message, and frees resources. */
 void remove_client(client_t *client) {
-    char msg[256];
+    char msg[128];
     snprintf(msg, sizeof(msg), "Player %d disconnected\n", client->id);
     broadcast_message(msg, client);
 
-    if (clients == client)
+    if (clients == client) {
         clients = client->next;
-    else {
+    } else {
         client_t *prev = clients;
         while (prev && prev->next != client)
             prev = prev->next;
@@ -171,6 +232,7 @@ void remove_client(client_t *client) {
             prev->next = client->next;
     }
     close(client->fd);
+
     free(client->in_buffer);
     message_t *m = client->msg_head;
     while (m) {
@@ -182,6 +244,7 @@ void remove_client(client_t *client) {
     free(client);
 }
 
+/* Returns an available ID from 1..max_players that isn't in use. */
 int get_available_client_id(void) {
     int used[max_players+1];
     memset(used, 0, sizeof(used));
@@ -197,7 +260,9 @@ int get_available_client_id(void) {
     return -1;
 }
 
-/* Message queue helpers */
+/* --- Message Queue Helpers --- */
+
+/* Enqueues a line (with trailing newline) into the client's outgoing queue. */
 void enqueue_message(client_t *client, const char *text) {
     message_t *msg = malloc(sizeof(message_t));
     if (!msg) {
@@ -210,7 +275,10 @@ void enqueue_message(client_t *client, const char *text) {
         free(msg);
         exit(EXIT_FAILURE);
     }
+    msg->length = (int)strlen(msg->text);
+    msg->sent_offset = 0;
     msg->next = NULL;
+
     if (client->msg_tail)
         client->msg_tail->next = msg;
     else
@@ -218,234 +286,233 @@ void enqueue_message(client_t *client, const char *text) {
     client->msg_tail = msg;
 }
 
-message_t *dequeue_message(client_t *client) {
-    message_t *msg = client->msg_head;
-    if (msg) {
-        client->msg_head = msg->next;
-        if (!client->msg_head)
-            client->msg_tail = NULL;
-    }
-    return msg;
-}
-
-void broadcast_message(const char *text, client_t *skip_client) {
+/* Sends a message to all clients except an optional one to skip. */
+void broadcast_message(const char *text, client_t *skip) {
     client_t *cur = clients;
     while (cur) {
-        if (cur != skip_client)
+        if (cur != skip)
             enqueue_message(cur, text);
         cur = cur->next;
     }
 }
 
-/* Buffer and message processing */
+/* --- Buffer and Message Processing --- */
+
+/* Appends newly received data to the client's dynamic input buffer. */
 void append_to_client_buffer(client_t *client, const char *data, int len) {
     if (client->in_buffer_size + len > client->in_buffer_capacity) {
-        int new_capacity = client->in_buffer_capacity * 2;
-        while (client->in_buffer_size + len > new_capacity)
-            new_capacity *= 2;
-        char *new_buffer = realloc(client->in_buffer, new_capacity);
-        if (!new_buffer) {
+        int new_cap = client->in_buffer_capacity * 2;
+        while (client->in_buffer_size + len > new_cap)
+            new_cap *= 2;
+        char *new_buf = realloc(client->in_buffer, new_cap);
+        if (!new_buf) {
             perror("realloc");
             exit(EXIT_FAILURE);
         }
-        client->in_buffer = new_buffer;
-        client->in_buffer_capacity = new_capacity;
+        client->in_buffer = new_buf;
+        client->in_buffer_capacity = new_cap;
     }
     memcpy(client->in_buffer + client->in_buffer_size, data, len);
     client->in_buffer_size += len;
 }
 
+/* Processes complete lines (ending with '\n'). Each line is a guess or "quit". */
 void process_client_messages(client_t *client) {
-    int processed = 0;
+    int start = 0;
     for (int i = 0; i < client->in_buffer_size; i++) {
         if (client->in_buffer[i] == '\n') {
-            int line_length = i - processed;
-            char *line = malloc(line_length + 1);
+            int line_len = i - start;
+            char *line = malloc(line_len + 1);
             if (!line) {
                 perror("malloc");
                 exit(EXIT_FAILURE);
             }
-            memcpy(line, client->in_buffer + processed, line_length);
-            line[line_length] = '\0';
-            if (line_length > 0 && line[line_length - 1] == '\r')
-                line[line_length - 1] = '\0';
+            memcpy(line, client->in_buffer + start, line_len);
+            line[line_len] = '\0';
+
+            if (line_len > 0 && line[line_len - 1] == '\r')
+                line[line_len - 1] = '\0';
+
             if (strcmp(line, "quit") == 0) {
                 free(line);
                 remove_client(client);
                 return;
             } else {
                 int guess = atoi(line);
-                char guess_msg[256];
-                snprintf(guess_msg, sizeof(guess_msg), "Player %d guessed %d\n", client->id, guess);
-                broadcast_message(guess_msg, NULL);
-                char response[256];
-                if (guess < current_target) {
-                    snprintf(response, sizeof(response), "The guess %d is too low\n", guess);
-                    broadcast_message(response, NULL);
-                } else if (guess > current_target) {
-                    snprintf(response, sizeof(response), "The guess %d is too high\n", guess);
-                    broadcast_message(response, NULL);
-                } else {
-                    snprintf(response, sizeof(response), "Player %d wins\nThe correct guessing is %d\n", client->id, guess);
-                    broadcast_message(response, NULL);
-                    client_t *cur = clients;
-                    while (cur) {
-                        while (cur->msg_head) {
-                            message_t *msg = dequeue_message(cur);
-                            if (msg) {
-                                send(cur->fd, msg->text, strlen(msg->text), 0);
-                                free(msg->text);
-                                free(msg);
-                            }
-                        }
-                        cur = cur->next;
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Player %d guessed %d\n", client->id, guess);
+                broadcast_message(msg, NULL);
+
+                if (!game_over) {
+                    if (guess < current_target) {
+                        snprintf(msg, sizeof(msg), "The guess %d is too low\n", guess);
+                        broadcast_message(msg, NULL);
+                    } else if (guess > current_target) {
+                        snprintf(msg, sizeof(msg), "The guess %d is too high\n", guess);
+                        broadcast_message(msg, NULL);
+                    } else {
+                        snprintf(msg, sizeof(msg), "Player %d wins\n", client->id);
+                        broadcast_message(msg, NULL);
+                        snprintf(msg, sizeof(msg), "The correct guessing is %d\n", guess);
+                        broadcast_message(msg, NULL);
+                        game_over = 1;
                     }
-                    sleep(1);
-                    cur = clients;
-                    while (cur) {
-                        close(cur->fd);
-                        cur = cur->next;
-                    }
-                    while (clients) {
-                        client_t *tmp = clients;
-                        clients = clients->next;
-                        free(tmp->in_buffer);
-                        message_t *m = tmp->msg_head;
-                        while (m) {
-                            message_t *tmp_m = m;
-                            m = m->next;
-                            free(tmp_m->text);
-                            free(tmp_m);
-                        }
-                        free(tmp);
-                    }
-                    current_target = (rand() % TARGET_RANGE) + 1;
-                    printf("New game started. New target generated.\n");
-                    free(line);
-                    return;
                 }
             }
             free(line);
-            processed = i + 1;
+            start = i + 1;
         }
     }
-    if (processed > 0) {
-        if (processed < client->in_buffer_size)
-            memmove(client->in_buffer, client->in_buffer + processed, client->in_buffer_size - processed);
-        client->in_buffer_size -= processed;
+    if (start > 0) {
+        if (start < client->in_buffer_size)
+            memmove(client->in_buffer, client->in_buffer + start, client->in_buffer_size - start);
+        client->in_buffer_size -= start;
     }
 }
 
-void flush_client_queues(void) {
-    client_t *cur = clients;
-    while (cur) {
-        while (cur->msg_head) {
-            message_t *msg = dequeue_message(cur);
-            if (msg) {
-                send(cur->fd, msg->text, strlen(msg->text), 0);
-                free(msg->text);
-                free(msg);
-            }
-        }
-        cur = cur->next;
-    }
-}
+/* --- I/O Handling --- */
 
-/* I/O handling */
+/* Accepts new connections if there's an available ID. */
 void accept_new_connection(void) {
-    struct sockaddr_in client_addr;
-    socklen_t addrlen = sizeof(client_addr);
-    int new_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
-    if (new_fd != -1) {
+    struct sockaddr_in caddr;
+    socklen_t addrlen = sizeof(caddr);
+    int new_fd = accept(server_fd, (struct sockaddr *)&caddr, &addrlen);
+    if (new_fd >= 0) {
         set_socket_nonblocking(new_fd);
         int new_id = get_available_client_id();
         if (new_id == -1) {
             close(new_fd);
         } else {
-            client_t *new_client = create_client(new_fd, new_id);
-            if (!new_client) {
+            client_t *c = create_client(new_fd, new_id);
+            if (!c) {
                 close(new_fd);
             } else {
-                add_client(new_client);
-                char welcome_msg[256];
-                snprintf(welcome_msg, sizeof(welcome_msg), "Welcome to the game, your id is %d\n", new_id);
-                enqueue_message(new_client, welcome_msg);
-                char join_msg[256];
-                snprintf(join_msg, sizeof(join_msg), "Player %d joined the game\n", new_id);
-                broadcast_message(join_msg, new_client);
+                add_client(c);
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Welcome to the game, your id is %d\n", new_id);
+                enqueue_message(c, buf);
+
+                snprintf(buf, sizeof(buf), "Player %d joined the game\n", new_id);
+                broadcast_message(buf, c);
             }
         }
     }
 }
 
+/* Reads incoming data from a client and processes complete lines. */
 void read_from_client(client_t *client) {
-    char buffer[512];
-    int bytes = recv(client->fd, buffer, sizeof(buffer), 0);
+    char buf[512];
+    int bytes = recv(client->fd, buf, sizeof(buf), 0);
     if (bytes <= 0) {
         remove_client(client);
     } else {
-        append_to_client_buffer(client, buffer, bytes);
+        append_to_client_buffer(client, buf, bytes);
         process_client_messages(client);
     }
 }
 
+/* Writes exactly one queued message per call, handling partial writes. */
 void write_to_client(client_t *client) {
-    if (client->msg_head) {
-        message_t *msg = dequeue_message(client);
-        if (msg) {
-            int sent = send(client->fd, msg->text, strlen(msg->text), 0);
-            if (sent == -1) {
-                remove_client(client);
-            }
+    message_t *msg = client->msg_head;
+    if (!msg) return;
+
+    int remaining = msg->length - msg->sent_offset;
+    int sent = send(client->fd, msg->text + msg->sent_offset, remaining, 0);
+    if (sent > 0) {
+        msg->sent_offset += sent;
+        if (msg->sent_offset == msg->length) {
+            /* Entire message sent; dequeue it. */
+            client->msg_head = msg->next;
+            if (!client->msg_head)
+                client->msg_tail = NULL;
             free(msg->text);
             free(msg);
+        }
+    } else if (sent < 0) {
+        if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            remove_client(client);
         }
     }
 }
 
-/* Cleanup */
+/*
+ * Checks if all messages have been fully sent to every client.
+ * If the game is over and all queues are empty, close all clients, start a new game.
+ */
+void check_if_all_messages_sent(void) {
+    if (!game_over) return;  /* Only check if game is over. */
+
+    client_t *c = clients;
+    while (c) {
+        if (c->msg_head) {
+            return;  /* There's still something left to send. */
+        }
+        c = c->next;
+    }
+    /* All messages are sent. Close all clients. */
+    c = clients;
+    while (c) {
+        close(c->fd);
+        c = c->next;
+    }
+    while (clients) {
+        client_t *tmp = clients;
+        clients = clients->next;
+        free(tmp->in_buffer);
+        message_t *m = tmp->msg_head;
+        while (m) {
+            message_t *t2 = m;
+            m = m->next;
+            free(t2->text);
+            free(t2);
+        }
+        free(tmp);
+    }
+    start_new_game();
+}
+
+/* Resets the game state with a new target number. */
+void start_new_game(void) {
+    current_target = (rand() % TARGET_RANGE) + 1;
+    game_over = 0;
+    printf("New game started. New target generated.\n");
+}
+
+/* --- Cleanup --- */
+
 void cleanup_all(void) {
-    client_t *cur = clients;
-    while (cur) {
-        close(cur->fd);
-        free(cur->in_buffer);
-        message_t *m = cur->msg_head;
+    client_t *c = clients;
+    while (c) {
+        close(c->fd);
+        free(c->in_buffer);
+        message_t *m = c->msg_head;
         while (m) {
             message_t *tmp = m;
             m = m->next;
             free(tmp->text);
             free(tmp);
         }
-        client_t *tmp_client = cur;
-        cur = cur->next;
-        free(tmp_client);
+        client_t *tmpc = c;
+        c = c->next;
+        free(tmpc);
     }
-    if (server_fd != -1)
+    if (server_fd != -1) {
         close(server_fd);
+    }
 }
 
-/* Main */
+/* --- Main --- */
+
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: ./server <port> <seed> <max-number-of-players>\n");
-        exit(EXIT_FAILURE);
-    }
-
-    port = atoi(argv[1]);
-    int seed = atoi(argv[2]);
-    max_players = atoi(argv[3]);
-    if (port < 1 || port > 65535 || max_players <= 1) {
-        fprintf(stderr, "Usage: ./server <port> <seed> <max-number-of-players>\n");
-        exit(EXIT_FAILURE);
-    }
-
-    srand(seed);
-    current_target = (rand() % TARGET_RANGE) + 1;
+    parse_arguments(argc, argv);
     init_signal_handler();
+
+    current_target = (rand() % TARGET_RANGE) + 1;
     server_fd = create_listening_socket(port);
-    printf("Server listening on port %d. A target number is generated.\n", port);
+    printf("Server listening on port %d. Target number is generated.\n", port);
 
     while (1) {
+        /* Safely check if we should exit. */
         sigset_t newmask, oldmask;
         sigemptyset(&newmask);
         sigaddset(&newmask, SIGINT);
@@ -455,19 +522,25 @@ int main(int argc, char *argv[]) {
         if (local_exit)
             break;
 
+        /* Check if all messages are sent if the game ended. */
+        check_if_all_messages_sent();
+
         fd_set read_set, write_set;
         FD_ZERO(&read_set);
         FD_ZERO(&write_set);
         int max_fd = server_fd;
         FD_SET(server_fd, &read_set);
-        client_t *cur = clients;
-        while (cur) {
-            FD_SET(cur->fd, &read_set);
-            if (cur->msg_head)
-                FD_SET(cur->fd, &write_set);
-            if (cur->fd > max_fd)
-                max_fd = cur->fd;
-            cur = cur->next;
+
+        client_t *c = clients;
+        while (c) {
+            FD_SET(c->fd, &read_set);
+            if (c->msg_head) {
+                FD_SET(c->fd, &write_set);
+            }
+            if (c->fd > max_fd) {
+                max_fd = c->fd;
+            }
+            c = c->next;
         }
 
         int activity = select(max_fd + 1, &read_set, &write_set, NULL, NULL);
@@ -477,23 +550,29 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
 
-        if (FD_ISSET(server_fd, &read_set))
+        /* If the listening socket is ready, accept a new connection. */
+        if (FD_ISSET(server_fd, &read_set)) {
             accept_new_connection();
-
-        cur = clients;
-        while (cur) {
-            client_t *next = cur->next;
-            if (FD_ISSET(cur->fd, &read_set))
-                read_from_client(cur);
-            cur = next;
         }
 
-        cur = clients;
-        while (cur) {
-            client_t *next = cur->next;
-            if (FD_ISSET(cur->fd, &write_set) && cur->msg_head)
-                write_to_client(cur);
-            cur = next;
+        /* Handle readable clients. */
+        c = clients;
+        while (c) {
+            client_t *next = c->next;
+            if (FD_ISSET(c->fd, &read_set)) {
+                read_from_client(c);
+            }
+            c = next;
+        }
+
+        /* Handle writable clients. (One line per iteration) */
+        c = clients;
+        while (c) {
+            client_t *next = c->next;
+            if (FD_ISSET(c->fd, &write_set) && c->msg_head) {
+                write_to_client(c);
+            }
+            c = next;
         }
     }
 
