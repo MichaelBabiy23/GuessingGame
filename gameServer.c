@@ -1,6 +1,5 @@
 /*
  * Usage: ./game_server <port> <seed> <max-number-of-players>
- * Example: ./game_server 5000 42 4
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,7 +48,9 @@ int max_players = 0;
 int current_target = 0;
 int port = 0;
 sig_atomic_t exit_requested = 0;
-int game_over = 0;  /* Set to 1 when a correct guess occurs */
+/* game_over is set to 1 when a correct guess occurs. When set,
+   once all clients’ outgoing queues are empty the game resets. */
+int game_over = 0;
 
 /* ----- Function Prototypes ----- */
 void sigint_handler(int sig);
@@ -346,7 +347,6 @@ void accept_new_connection(void) {
     socklen_t addrlen = sizeof(caddr);
     int new_fd = accept(server_fd, (struct sockaddr *)&caddr, &addrlen);
     if (new_fd >= 0) {
-        /* Removed duplicate print here; main loop prints readiness for welcome socket */
         set_socket_nonblocking(new_fd);
         int new_id = get_available_client_id();
         if (new_id == -1) {
@@ -368,7 +368,6 @@ void accept_new_connection(void) {
 }
 
 void read_from_client(client_t *client) {
-    /* Removed duplicate print; main loop handles readiness message */
     char buf[512];
     int bytes = recv(client->fd, buf, sizeof(buf), 0);
     if (bytes <= 0) {
@@ -382,7 +381,6 @@ void read_from_client(client_t *client) {
 void write_to_client(client_t *client) {
     if (!client->msg_head)
         return;
-    /* Removed duplicate print; main loop handles readiness message */
     message_t *msg = client->msg_head;
     int remaining = msg->length - msg->sent_offset;
     int sent = send(client->fd, msg->text + msg->sent_offset, remaining, 0);
@@ -403,8 +401,8 @@ void write_to_client(client_t *client) {
 }
 
 /*
- * If game_over is set, check if all outgoing queues are empty.
- * Once they are empty, close all client sockets, free them, and start a new game.
+ * If game_over is set, check if all clients’ outgoing queues are empty.
+ * Once all are empty, close all client connections, free them, and start a new game.
  */
 void check_if_all_messages_sent(void) {
     if (!game_over)
@@ -412,7 +410,7 @@ void check_if_all_messages_sent(void) {
     client_t *c = clients;
     while (c) {
         if (c->msg_head)
-            return;  /* Still pending messages */
+            return;  /* Some messages still pending */
         c = c->next;
     }
     /* All messages have been sent. Close all client connections and free them. */
