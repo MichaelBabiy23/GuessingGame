@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <ctype.h>
+#include <fcntl.h>
 
 #define BUFFER_SIZE 1024
 #define DEBUG 0
@@ -30,26 +31,27 @@ typedef struct {
     int id;                 // Client ID (1 to max_players)
     MessageNode *queue;     // Message queue head
     MessageNode *queue_tail;// Message queue tail
+    int printed_write;      // Flag: 0 if "ready to write" not printed for current flush cycle, 1 if printed
 } Client;
 
 // Global variables
 int max_players, listen_fd, max_fd, target_num, client_count = 0, game_over = 0;
 Client* clients;
 
-// Function prototypes
+// Function prototypes – using your function names:
 int isInteger(const char *str);
 int enqueue_message(Client *client, const char *message);
 char *dequeue_message(Client *client);
 void free_message_queue(Client* client);
 void free_clients();
-int broadcast_message(Client* clients, const char *message, fd_set* set_write, int max_fd, int current_client);
+int broadcast_message(Client* clients, const char *message, fd_set *set_write, int max_fd, int current_client);
 void cleanup_and_exit(int signum);
-void accept_new_client(int *client_count, int* max_fd, fd_set* temp_set_read, fd_set* temp_set_write);
-void handle_client_input(int i, fd_set *temp_set_read, fd_set *temp_set_write);
-void send_message(int i, fd_set *temp_set_read, fd_set *temp_set_write);
+void accept_new_client(int *client_count, int *max_fd, fd_set *set_read, fd_set *set_write);
+void handle_client_input(int i, fd_set *set_read, fd_set *set_write);
+void send_message(int i, fd_set *set_read, fd_set *set_write);
 void update_max_fd();
 
-// Check if string is a valid integer
+// Check if a string is a valid integer
 int isInteger(const char *str) {
     char *endptr;
     long value = strtol(str, &endptr, 10);
@@ -60,7 +62,7 @@ int isInteger(const char *str) {
     return 1;
 }
 
-// Enqueue a message (one line) for a client
+// Enqueue a message (one complete line) for a client
 int enqueue_message(Client *client, const char *message) {
     MessageNode *new_node = (MessageNode *)malloc(sizeof(MessageNode));
     if (!new_node) {
@@ -70,6 +72,9 @@ int enqueue_message(Client *client, const char *message) {
     strncpy(new_node->message, message, BUFFER_SIZE - 1);
     new_node->message[BUFFER_SIZE - 1] = '\0';
     new_node->next = NULL;
+    // Reset printed_write flag if queue was empty
+    if (!client->queue)
+        client->printed_write = 0;
     if (!client->queue) {
         client->queue = new_node;
         client->queue_tail = new_node;
@@ -90,6 +95,9 @@ char *dequeue_message(Client *client) {
     if (!client->queue)
         client->queue_tail = NULL;
     free(node);
+    // Reset printed_write flag when queue becomes empty.
+    if (!client->queue)
+        client->printed_write = 0;
     return msg;
 }
 
@@ -103,9 +111,10 @@ void free_message_queue(Client* client) {
         current = next;
     }
     client->queue = client->queue_tail = NULL;
+    client->printed_write = 0;
 }
 
-// Free all clients
+// Free all clients and close their sockets
 void free_clients() {
     for (int i = 0; i < max_players; i++) {
         if (clients[i].fd != 0) {
@@ -116,7 +125,7 @@ void free_clients() {
 }
 
 // Broadcast a message to all clients; if current_client != -1, skip that index
-int broadcast_message(Client* clients, const char *message, fd_set* set_write, int max_fd, int current_client) {
+int broadcast_message(Client* clients, const char *message, fd_set *set_write, int max_fd, int current_client) {
     for (int j = 0; j < max_players; j++) {
         if (clients[j].fd != 0) {
             if (current_client == -1 || j != current_client) {
@@ -129,7 +138,7 @@ int broadcast_message(Client* clients, const char *message, fd_set* set_write, i
     return 0;
 }
 
-// Cleanup resources and exit
+// Clean up resources and exit
 void cleanup_and_exit(int signum) {
     free_clients();
     free(clients);
@@ -139,7 +148,7 @@ void cleanup_and_exit(int signum) {
 }
 
 // Accept a new client connection
-void accept_new_client(int *client_count, int* max_fd, fd_set* temp_set_read, fd_set* temp_set_write) {
+void accept_new_client(int *client_count, int *max_fd, fd_set *set_read, fd_set *set_write) {
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
     int new_socket = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
@@ -147,7 +156,7 @@ void accept_new_client(int *client_count, int* max_fd, fd_set* temp_set_read, fd
         perror("accept");
         cleanup_and_exit(-1);
     }
-    // Set non-blocking
+    // Set new socket non-blocking
     int flags = fcntl(new_socket, F_GETFL, 0);
     fcntl(new_socket, F_SETFL, flags | O_NONBLOCK);
     char buffer[BUFFER_SIZE];
@@ -156,86 +165,104 @@ void accept_new_client(int *client_count, int* max_fd, fd_set* temp_set_read, fd
         if (clients[i].fd == 0) {
             clients[i].fd = new_socket;
             clients[i].id = i + 1;
-            FD_SET(new_socket, temp_set_read);
+            clients[i].printed_write = 0;
+            FD_SET(new_socket, set_read);
             if (new_socket > *max_fd)
                 *max_fd = new_socket;
             (*client_count)++;
             sprintf(buffer, "Welcome to the game, your id is %d\n", clients[i].id);
             if (enqueue_message(&clients[i], buffer) < 0)
                 cleanup_and_exit(-1);
-            FD_SET(new_socket, temp_set_write);
+            // Immediately send the welcome message (flush one line)
+            send_message(i, set_read, set_write);
+            FD_SET(new_socket, set_write);
             sprintf(buffer, "Player %d joined the game\n", clients[i].id);
-            if (broadcast_message(clients, buffer, temp_set_write, *max_fd, i) < 0)
+            if (broadcast_message(clients, buffer, set_write, *max_fd, i) < 0)
                 cleanup_and_exit(-1);
             break;
         }
     }
 }
 
-// Handle client input: read data, convert to integer guess, broadcast responses.
-// If the client disconnects, remove it.
-void handle_client_input(int i, fd_set *temp_set_read, fd_set *temp_set_write) {
+// Handle client input: read data, check for "quit", or process guess and broadcast responses.
+void handle_client_input(int i, fd_set *set_read, fd_set *set_write) {
     char buffer[BUFFER_SIZE];
     char num_buffer[20];
     int bytes_read = read(clients[i].fd, num_buffer, sizeof(num_buffer) - 1);
     if (bytes_read <= 0) {
         // Client disconnected
         close(clients[i].fd);
-        FD_CLR(clients[i].fd, temp_set_read);
-        FD_CLR(clients[i].fd, temp_set_write);
+        FD_CLR(clients[i].fd, set_read);
+        FD_CLR(clients[i].fd, set_write);
         free_message_queue(&clients[i]);
         client_count--;
         sprintf(buffer, "Player %d disconnected\n", clients[i].id);
-        if (broadcast_message(clients, buffer, temp_set_write, max_fd, i) < 0)
-            cleanup_and_exit(-1);
+        broadcast_message(clients, buffer, set_write, max_fd, i);
         clients[i].id = 0;
         if (clients[i].fd == max_fd)
             update_max_fd();
         clients[i].fd = 0;
     } else {
         num_buffer[bytes_read] = '\0';
+        // Check if client sends "quit"
+        if (strncmp(num_buffer, "quit", 4) == 0) {
+            close(clients[i].fd);
+            FD_CLR(clients[i].fd, set_read);
+            FD_CLR(clients[i].fd, set_write);
+            free_message_queue(&clients[i]);
+            client_count--;
+            sprintf(buffer, "Player %d disconnected\n", clients[i].id);
+            broadcast_message(clients, buffer, set_write, max_fd, i);
+            clients[i].id = 0;
+            if (clients[i].fd == max_fd)
+                update_max_fd();
+            clients[i].fd = 0;
+            return;
+        }
         int num = atoi(num_buffer);
         sprintf(buffer, "Player %d guessed %d\n", clients[i].id, num);
-        if (broadcast_message(clients, buffer, temp_set_write, max_fd, -1) < 0)
-            cleanup_and_exit(-1);
+        broadcast_message(clients, buffer, set_write, max_fd, -1);
         if (num < target_num)
             sprintf(buffer, "The guess %d is too low\n", num);
         else if (num > target_num)
             sprintf(buffer, "The guess %d is too high\n", num);
         else {
             sprintf(buffer, "Player %d wins\n", clients[i].id);
-            if (broadcast_message(clients, buffer, temp_set_write, max_fd, -1) < 0)
-                cleanup_and_exit(-1);
+            broadcast_message(clients, buffer, set_write, max_fd, -1);
             sprintf(buffer, "The correct guessing is %d\n", num);
-            if (broadcast_message(clients, buffer, temp_set_write, max_fd, -1) < 0)
-                cleanup_and_exit(-1);
+            broadcast_message(clients, buffer, set_write, max_fd, -1);
             game_over = 1;
         }
     }
 }
 
-// Send one message (one line) from the client's queue
-void send_message(int i, fd_set *temp_set_read, fd_set *temp_set_write) {
+// Send one queued message (one line) from the client's queue.
+// This function sends exactly one line per call.
+void send_message(int i, fd_set *set_read, fd_set *set_write) {
     char *message = dequeue_message(&clients[i]);
     if (message) {
         write(clients[i].fd, message, strlen(message));
         free(message);
     }
-    // If the queue is empty and a win occurred, disconnect this client
+    // Reset printed_write flag if queue becomes empty
+    if (!clients[i].queue)
+        clients[i].printed_write = 0;
+    // If game_over is set and queue is empty, disconnect this client.
     if (!clients[i].queue && game_over) {
-        FD_CLR(clients[i].fd, temp_set_write);
+        FD_CLR(clients[i].fd, set_write);
         close(clients[i].fd);
         client_count--;
-        FD_CLR(clients[i].fd, temp_set_read);
-        FD_CLR(clients[i].fd, temp_set_write);
+        FD_CLR(clients[i].fd, set_read);
+        FD_CLR(clients[i].fd, set_write);
         clients[i].id = 0;
         if (clients[i].fd == max_fd)
             update_max_fd();
         clients[i].fd = 0;
+        clients[i].printed_write = 0;
     }
 }
 
-// Update the maximum file descriptor
+// Update the maximum file descriptor among all clients
 void update_max_fd() {
     max_fd = listen_fd;
     for (int i = 0; i < max_players; i++) {
@@ -245,7 +272,7 @@ void update_max_fd() {
 }
 
 int main(int argc, char *argv[]) {
-    // Validate arguments
+    // Validate command-line arguments
     if (argc != 4) {
         printf("Usage: ./server <port> <seed> <max-number-of-players>\n");
         exit(EXIT_FAILURE);
@@ -254,7 +281,6 @@ int main(int argc, char *argv[]) {
         printf("Usage: ./server <port> <seed> <max-number-of-players>\n");
         exit(EXIT_FAILURE);
     }
-
     int port_num = atoi(argv[1]);
     int seed = atoi(argv[2]);
     max_players = atoi(argv[3]);
@@ -265,7 +291,6 @@ int main(int argc, char *argv[]) {
     srand(seed);
     target_num = (rand() % 100) + 1;
 
-    // Set up server address and socket
     struct sockaddr_in srv;
     if ((listen_fd = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket");
@@ -294,22 +319,27 @@ int main(int argc, char *argv[]) {
     memset(clients, 0, max_players * sizeof(Client));
 
     int activity;
-    fd_set set_read, set_write, temp_set_read, temp_set_write;
+    fd_set set_read, set_write;
 
-    FD_ZERO(&temp_set_read);
-    FD_ZERO(&temp_set_write);
-    FD_SET(listen_fd, &temp_set_read);
-    max_fd = listen_fd;
-
-    // Main server loop
     while (1) {
-        set_read = temp_set_read;
-        set_write = temp_set_write;
+        FD_ZERO(&set_read);
+        FD_ZERO(&set_write);
 
-        if (client_count == max_players)
-            FD_CLR(listen_fd, &set_read);
-        else
+        // Add the listen socket if there is room
+        if (client_count < max_players)
             FD_SET(listen_fd, &set_read);
+        max_fd = listen_fd;
+
+        // Rebuild FD sets from current clients array
+        for (int i = 0; i < max_players; i++) {
+            if (clients[i].fd != 0) {
+                FD_SET(clients[i].fd, &set_read);
+                if (clients[i].queue)
+                    FD_SET(clients[i].fd, &set_write);
+                if (clients[i].fd > max_fd)
+                    max_fd = clients[i].fd;
+            }
+        }
 
         activity = select(max_fd + 1, &set_read, &set_write, NULL, NULL);
         if (activity < 0) {
@@ -320,26 +350,30 @@ int main(int argc, char *argv[]) {
         // Handle new connection on welcome socket
         if (FD_ISSET(listen_fd, &set_read)) {
             printf("Server is ready to read from welcome socket %d\n", listen_fd);
-            accept_new_client(&client_count, &max_fd, &temp_set_read, &temp_set_write);
+            accept_new_client(&client_count, &max_fd, &set_read, &set_write);
             activity--;
         }
 
-        // Handle input from existing clients
+        // Process I/O for each client
         for (int i = 0; i < max_players && activity > 0; i++) {
             if (clients[i].fd != 0) {
                 if (FD_ISSET(clients[i].fd, &set_read)) {
                     printf("Server is ready to read from player %d on socket %d\n", clients[i].id, clients[i].fd);
-                    handle_client_input(i, &temp_set_read, &temp_set_write);
+                    handle_client_input(i, &set_read, &set_write);
                     activity--;
                 }
-                if (FD_ISSET(clients[i].fd, &set_write)) {
-                    printf("Server is ready to write to player %d on socket %d\n", clients[i].id, clients[i].fd);
-                    send_message(i, &temp_set_read, &temp_set_write);
+                if (FD_ISSET(clients[i].fd, &set_write) && clients[i].queue) {
+                    if (clients[i].printed_write == 0) {
+                        printf("Server is ready to write to player %d on socket %d\n", clients[i].id, clients[i].fd);
+                        clients[i].printed_write = 1;
+                    }
+                    send_message(i, &set_read, &set_write);
                     activity--;
                 }
             }
         }
-        // If game_over is set and all clients have disconnected, start a new game round.
+
+        // If game_over is set and no clients remain, start a new game round.
         if (game_over && client_count == 0) {
             target_num = (rand() % 100) + 1;
             game_over = 0;
@@ -347,6 +381,7 @@ int main(int argc, char *argv[]) {
             printf("New game started. New target generated.\n");
         }
     }
+
     cleanup_and_exit(0);
     return 0;
 }
