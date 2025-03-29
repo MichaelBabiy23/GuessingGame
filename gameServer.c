@@ -158,26 +158,29 @@ Client* add_client(int fd, int assigned_id) {
 }
 
 void remove_client(Client **client) {
-    if (client_list == *client) {
-        if ((*client)->next)
-            client_list = (*client)->next;
-        else
-            client_list = NULL;
-    }
-    else {
+    Client *to_remove = *client;
+    // Remove to_remove from the global linked list.
+    if (client_list == to_remove) {
+        client_list = to_remove->next;
+    } else {
         Client *cur = client_list;
-        while (cur && cur->next != *client)
+        while (cur && cur->next != to_remove)
             cur = cur->next;
         if (cur)
-            cur->next = (*client)->next;
+            cur->next = to_remove->next;
     }
-    free_message_queue(*client);
-    FD_CLR((*client)->fd, &writeset);
-    FD_CLR((*client)->fd, &readset);
-    len_client_list--;
-    close((*client)->fd);
-    (*client)->fd = 0;
-    //free(*client);
+    // Free the message queue for this client.
+    free_message_queue(to_remove);
+    // Remove file descriptor from global FD sets.
+    FD_CLR(to_remove->fd, &writeset);
+    FD_CLR(to_remove->fd, &readset);
+    len_client_list--;  // Decrement the count.
+    close(to_remove->fd);
+    to_remove->fd = 0;
+    // Free the client structure.
+    free(to_remove);
+    // Set the pointer to NULL to avoid dangling pointer issues.
+    *client = NULL;
 }
 
 int get_available_client_id(void) {
@@ -403,8 +406,8 @@ int main(int argc, char *argv[]) {
             game_over = 0;
             max_fd = listen_fd;
         }
-        if (len_client_list == 1)
-            cleanup_and_exit(10);
+        // if (len_client_list == 1)
+        //    cleanup_and_exit(10);
     }
     cleanup_and_exit(0);
     return 0;
