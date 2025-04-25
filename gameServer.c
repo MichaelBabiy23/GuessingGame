@@ -1,3 +1,5 @@
+// gameServer.c
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,34 +16,33 @@
 #define BUFFER_SIZE 1024
 
 // ----- Data Structures -----
-
-// Message node for a client's outgoing message queue.
 typedef struct Message {
-    char *text;             // Dynamically allocated message (ends with '\n')
+    char *text;
     struct Message *next;
 } Message;
 
-// Client structure.
 typedef struct Client {
-    int fd;                 // Client's socket descriptor
-    int id;                 // Assigned id (1 to max-number-of-players)
-    Message *msg_head;      // Head of outgoing message queue
-    Message *msg_tail;      // Tail of outgoing message queue
-    struct Client *next;    // Pointer to next client in linked list
+    int fd;
+    int id;
+    Message *msg_head;
+    Message *msg_tail;
+    struct Client *next;
 } Client;
 
 // ----- Global Variables -----
-int listen_fd;                  // Listening socket
-int max_players;                // Maximum allowed players
-int target_number;              // Current target number to guess
-Client *client_list = NULL;     // Linked list of active clients
-sig_atomic_t exit_requested = 0;
-int game_over = 0;              // Set to 1 when a correct guess occurs
-fd_set readset, writeset;
+char *progname = NULL;      // set from argv[0]
+int listen_fd;              // listening socket
+int max_players;            // maximum concurrent players
+int target_number;          // current random target
+int game_over = 0;          // flagged when someone wins
 
-// For select() management.
-int max_fd;                     // Highest file descriptor currently in use
-int len_client_list = 0;        // Current number of connected clients
+Client *client_list = NULL; // linked list of active clients
+int len_client_list = 0;    // count of active clients
+int max_fd;                 // highest fd in any set
+
+// Heap-allocated fd_sets (only two pointers in .bss)
+fd_set *readset = NULL;
+fd_set *writeset = NULL;
 
 // ----- Function Prototypes -----
 void cleanup_and_exit(int signum);
@@ -50,46 +51,40 @@ void parse_arguments(int argc, char *argv[], int *port, int *seed, int *maxPlaye
 void set_socket_nonblocking(int fd);
 int create_listening_socket(int port);
 Client* add_client(int fd, int assigned_id);
-void remove_client(Client **client);
+void remove_client(Client **pclient);
 int get_available_client_id(void);
 void enqueue_message(Client *client, const char *msg);
 char* dequeue_message(Client *client);
 void broadcast_message(const char *msg, Client *exclude);
 void free_message_queue(Client *client);
 void free_all_clients(void);
-void accept_new_client();
-void read_from_client(Client **client);
-void write_to_client(Client **client);
-void check_if_all_messages_sent(fd_set *readset, fd_set *writeset);
-void start_new_game(void);
+void accept_new_client(void);
+void read_from_client(Client **pclient);
+void write_to_client(Client **pclient);
+void check_if_all_messages_sent(void);
+void reset_game(void);
 
 // ----- Signal Handling -----
 void cleanup_and_exit(int signum) {
-    // Ensure all clients are properly freed
     free_all_clients();
-
-    // Close listening socket
-    if (listen_fd > 0) {
-        close(listen_fd);
-    }
-
-    exit(signum == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+    if (listen_fd > 0) close(listen_fd);
+    free(readset);
+    free(writeset);
+    exit((signum == SIGINT) ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 // ----- Usage & Argument Parsing -----
 void usage_and_exit(void) {
-    fprintf(stderr, "Usage: ./server <port> <seed> <max-number-of-players>\n");
+    fprintf(stderr, "Usage: %s <port> <seed> <max-number-of-players>\n", progname);
     cleanup_and_exit(-1);
 }
 
 void parse_arguments(int argc, char *argv[], int *port, int *seed, int *maxPlayers) {
-    if (argc != 4)
-        usage_and_exit();
+    if (argc != 4) usage_and_exit();
     for (int i = 1; i < 4; i++) {
         char *endptr;
         strtol(argv[i], &endptr, 10);
-        if (*endptr != '\0')
-            usage_and_exit();
+        if (*endptr) usage_and_exit();
     }
     *port = atoi(argv[1]);
     *seed = atoi(argv[2]);
@@ -101,10 +96,7 @@ void parse_arguments(int argc, char *argv[], int *port, int *seed, int *maxPlaye
 // ----- Socket Utility -----
 void set_socket_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) {
-        perror("fcntl F_GETFL");
-        cleanup_and_exit(-1);
-    }
+    if (flags < 0) { perror("fcntl F_GETFL"); cleanup_and_exit(-1); }
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         perror("fcntl F_SETFL");
         cleanup_and_exit(-1);
@@ -113,303 +105,270 @@ void set_socket_nonblocking(int fd) {
 
 int create_listening_socket(int port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        perror("socket");
-        cleanup_and_exit(-1);
-    }
+    if (sockfd < 0) { perror("socket"); cleanup_and_exit(-1); }
     set_socket_nonblocking(sockfd);
 
     int opt = 1;
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
-        close(sockfd);
-        cleanup_and_exit(-1);
+        perror("setsockopt"); close(sockfd); cleanup_and_exit(-1);
     }
 
-    struct sockaddr_in srv;
-    memset(&srv, 0, sizeof(srv));
+    struct sockaddr_in srv = {0};
     srv.sin_family = AF_INET;
     srv.sin_addr.s_addr = INADDR_ANY;
     srv.sin_port = htons(port);
 
     if (bind(sockfd, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
-        perror("bind");
-        close(sockfd);
-        cleanup_and_exit(-1);
+        perror("bind"); close(sockfd); cleanup_and_exit(-1);
     }
     if (listen(sockfd, max_players) < 0) {
-        perror("listen");
-        close(sockfd);
-        cleanup_and_exit(-1);
+        perror("listen"); close(sockfd); cleanup_and_exit(-1);
     }
     return sockfd;
 }
 
 // ----- Client Management -----
 Client* add_client(int fd, int assigned_id) {
-    Client *new_client = malloc(sizeof(Client));
-    if (!new_client) {
-        perror("malloc");
-        cleanup_and_exit(-1);
-    }
-    new_client->fd = fd;
-    new_client->id = assigned_id;
-    new_client->msg_head = new_client->msg_tail = NULL;
-    new_client->next = client_list;
-    client_list = new_client;
+    Client *c = malloc(sizeof(Client));
+    if (!c) { perror("malloc"); cleanup_and_exit(-1); }
+    c->fd = fd;
+    c->id = assigned_id;
+    c->msg_head = c->msg_tail = NULL;
+    c->next = client_list;
+    client_list = c;
     len_client_list++;
-    return new_client;
+    return c;
 }
 
-void remove_client(Client **client) {
-    if (!client || !*client) return;  // Add null check
+void remove_client(Client **pclient) {
+    if (!pclient || !*pclient) return;
+    Client *c = *pclient;
 
-    Client *to_remove = *client;
-
-    // Remove from linked list
-    if (client_list == to_remove) {
-        client_list = to_remove->next;
+    // unlink from list
+    if (client_list == c) {
+        client_list = c->next;
     } else {
         Client *prev = client_list;
-        while (prev && prev->next != to_remove) {
-            prev = prev->next;
-        }
-        if (prev) {
-            prev->next = to_remove->next;
-        }
+        while (prev && prev->next != c) prev = prev->next;
+        if (prev) prev->next = c->next;
     }
-
-    // Free message queue
-    free_message_queue(to_remove);
-
-    // Clean up fd sets
-    FD_CLR(to_remove->fd, &writeset);
-    FD_CLR(to_remove->fd, &readset);
-
-    // Close socket
-    if (to_remove->fd > 0) {
-        close(to_remove->fd);
-    }
-
-    // Free client struct
-    free(to_remove);
-    *client = NULL;
     len_client_list--;
+
+    // notify other players
+    char m[BUFFER_SIZE];
+    snprintf(m, sizeof(m), "Player %d disconnected\n", c->id);
+    broadcast_message(m, c);
+
+    // clear from fd_sets
+    if (writeset) FD_CLR(c->fd, writeset);
+    if (readset)  FD_CLR(c->fd, readset);
+
+    close(c->fd);
+    free_message_queue(c);
+    free(c);
+    *pclient = NULL;
 }
 
 int get_available_client_id(void) {
-    int used[max_players + 1];
+    int used[max_players+1];
     memset(used, 0, sizeof(used));
-    for (Client *cur = client_list; cur != NULL; cur = cur->next)
-        used[cur->id] = 1;
-    for (int i = 1; i <= max_players; i++) {
-        if (!used[i])
-            return i;
-    }
+    for (Client *c = client_list; c; c = c->next) used[c->id] = 1;
+    for (int i = 1; i <= max_players; i++)
+        if (!used[i]) return i;
     return -1;
 }
 
 // ----- Message Queue Helpers -----
 void enqueue_message(Client *client, const char *msg) {
     Message *node = malloc(sizeof(Message));
-    if (!node) {
-        perror("malloc");
-        cleanup_and_exit(-1);
-    }
+    if (!node) { perror("malloc"); cleanup_and_exit(-1); }
     node->text = strdup(msg);
-    if (!node->text) {
-        perror("strdup");
-        free(node);
-        cleanup_and_exit(-1);
-    }
+    if (!node->text) { perror("strdup"); cleanup_and_exit(-1); }
     node->next = NULL;
-    if (!client->msg_head)
+
+    if (!client->msg_head) {
         client->msg_head = client->msg_tail = node;
-    else {
+    } else {
         client->msg_tail->next = node;
         client->msg_tail = node;
     }
-    FD_SET(client->fd, &writeset);
+    FD_SET(client->fd, writeset);
 }
 
 char* dequeue_message(Client *client) {
-    if (!client->msg_head)
-        return NULL;
-    Message *node = client->msg_head;
-    char *msg = strdup(node->text);
-    client->msg_head = node->next;
-    if (!client->msg_head)
-        client->msg_tail = NULL;
-    free(node->text);
-    free(node);
-    return msg;
+    if (!client->msg_head) return NULL;
+    Message *m = client->msg_head;
+    char *txt = strdup(m->text);
+    client->msg_head = m->next;
+    if (!client->msg_head) client->msg_tail = NULL;
+    free(m->text);
+    free(m);
+    return txt;
 }
 
 void broadcast_message(const char *msg, Client *exclude) {
-    for (Client *cur = client_list; cur != NULL; cur = cur->next) {
-        if (cur != exclude)
-            enqueue_message(cur, msg);
-    }
+    for (Client *c = client_list; c; c = c->next)
+        if (c != exclude)
+            enqueue_message(c, msg);
 }
 
 void free_message_queue(Client *client) {
     Message *cur = client->msg_head;
     while (cur) {
-        Message *tmp = cur;
-        cur = cur->next;
-        free(tmp->text);
-        free(tmp);
+        Message *next = cur->next;
+        free(cur->text);
+        free(cur);
+        cur = next;
     }
     client->msg_head = client->msg_tail = NULL;
 }
 
+// ----- Free All Clients -----
 void free_all_clients(void) {
-    while (client_list) {
-        Client *next = client_list->next;
-        free_message_queue(client_list);
-        if (client_list->fd > 0) {
-            close(client_list->fd);
-            FD_CLR(client_list->fd, &writeset);
-            FD_CLR(client_list->fd, &readset);
-        }
-        free(client_list);
-        client_list = next;
+    Client *cur = client_list;
+    while (cur) {
+        Client *next = cur->next;
+        close(cur->fd);
+        free_message_queue(cur);
+        free(cur);
+        cur = next;
     }
+    client_list = NULL;
     len_client_list = 0;
 
-    // Reset FD sets to base state
-    FD_ZERO(&writeset);
-    FD_ZERO(&readset);
-    FD_SET(listen_fd, &readset);
+    // only reset fd_sets if allocated
+    if (writeset) FD_ZERO(writeset);
+    if (readset) {
+        FD_ZERO(readset);
+        FD_SET(listen_fd, readset);
+    }
 }
 
 // ----- Game Logic -----
 void reset_game(void) {
     target_number = (rand() % 100) + 1;
     game_over = 0;
-    //printf("New game started. New target generated.\n");
 }
 
 // ----- I/O Handling -----
-void accept_new_client() {
+void accept_new_client(void) {
     struct sockaddr_in cli;
     socklen_t len = sizeof(cli);
     int fd = accept(listen_fd, (struct sockaddr *)&cli, &len);
-    if (fd < 0)
-        return;
+    if (fd < 0) return;
     set_socket_nonblocking(fd);
+
     int id = get_available_client_id();
-    if (id == -1) {
-        close(fd);
-        return;
-    }
-    Client *new_client = add_client(fd, id);
+    if (id < 0) { close(fd); return; }
+
+    Client *c = add_client(fd, id);
     char buf[BUFFER_SIZE];
-    snprintf(buf, BUFFER_SIZE, "Welcome to the game, your id is %d\n", id);
-    enqueue_message(new_client, buf);
-    FD_SET(fd, &readset);
-    FD_SET(fd, &writeset);
-    if (fd > max_fd)
-        max_fd = fd;
-    snprintf(buf, BUFFER_SIZE, "Player %d joined the game\n", id);
-    broadcast_message(buf, new_client);
+    snprintf(buf, sizeof(buf), "Welcome to the game, your id is %d\n", id);
+    enqueue_message(c, buf);
+
+    FD_SET(fd, readset);
+    FD_SET(fd, writeset);
+    if (fd > max_fd) max_fd = fd;
+
+    snprintf(buf, sizeof(buf), "Player %d joined the game\n", id);
+    broadcast_message(buf, c);
 }
 
-void read_from_client(Client **client) {
+void read_from_client(Client **pclient) {
+    Client *c = *pclient;
     char buf[BUFFER_SIZE];
-    int n = read((*client)->fd, buf, sizeof(buf) - 1);
+    int n = read(c->fd, buf, sizeof(buf) - 1);
     if (n <= 0) {
-        char msg[BUFFER_SIZE];
-        snprintf(msg, BUFFER_SIZE, "Player %d disconnected\n", (*client)->id);
-        broadcast_message(msg, *client);
-        remove_client(client);
+        remove_client(pclient);
         return;
-    } else {
-        buf[n] = '\0';
-        int guess = atoi(buf);
-        char msg[BUFFER_SIZE];
-        snprintf(msg, BUFFER_SIZE, "Player %d guessed %d\n", (*client)->id, guess);
+    }
+    buf[n] = '\0';
+    int guess = atoi(buf);
+    char msg[BUFFER_SIZE];
+
+    snprintf(msg, sizeof(msg), "Player %d guessed %d\n", c->id, guess);
+    broadcast_message(msg, NULL);
+
+    if (guess < target_number) {
+        snprintf(msg, sizeof(msg), "The guess %d is too low\n", guess);
         broadcast_message(msg, NULL);
-        if (guess < target_number) {
-            snprintf(msg, BUFFER_SIZE, "The guess %d is too low\n", guess);
-            broadcast_message(msg, NULL);
-        } else if (guess > target_number) {
-            snprintf(msg, BUFFER_SIZE, "The guess %d is too high\n", guess);
-            broadcast_message(msg, NULL);
-        } else {
-            snprintf(msg, BUFFER_SIZE, "Player %d wins\n", (*client)->id);
-            broadcast_message(msg, NULL);
-            snprintf(msg, BUFFER_SIZE, "The correct guessing is %d\n", guess);
-            broadcast_message(msg, NULL);
-            game_over = 1;
-        }
+    } else if (guess > target_number) {
+        snprintf(msg, sizeof(msg), "The guess %d is too high\n", guess);
+        broadcast_message(msg, NULL);
+    } else {
+        snprintf(msg, sizeof(msg), "Player %d wins\n", c->id);
+        broadcast_message(msg, NULL);
+        snprintf(msg, sizeof(msg), "The correct guessing is %d\n", guess);
+        broadcast_message(msg, NULL);
+        game_over = 1;
     }
 }
 
-void write_to_client(Client **client) {
-    char *msg = dequeue_message(*client);
+void write_to_client(Client **pclient) {
+    Client *c = *pclient;
+    char *msg = dequeue_message(c);
     if (msg) {
-        write((*client)->fd, msg, strlen(msg));
+        write(c->fd, msg, strlen(msg));
         free(msg);
     }
-    if (!(*client)->msg_head)
-        FD_CLR((*client)->fd, &writeset);
-    if (game_over && !(*client)->msg_head) {
-        remove_client(client);
-    }
+    if (!c->msg_head)
+        FD_CLR(c->fd, writeset);
+    // no per-client removal here
 }
 
-void check_if_all_messages_sent(fd_set *readset, fd_set *writeset) {
-    if (!game_over)
-        return;
-    for (Client *cur = client_list; cur != NULL; cur = cur->next)
-        if (cur->fd > 0 && cur->msg_head)
-            return;
-    // All messages have been sent.
-    for (Client *cur = client_list; cur != NULL; cur = cur->next) {
-        if (cur->fd > 0) {
-            close(cur->fd);
-            FD_CLR(cur->fd, readset);
-            FD_CLR(cur->fd, writeset);
-            cur->fd = 0;
-        }
+void check_if_all_messages_sent(void) {
+    if (!game_over) return;
+    for (Client *c = client_list; c; c = c->next)
+        if (c->msg_head) return;
+
+    // tear down all clients at once
+    for (Client *c = client_list; c; c = c->next) {
+        close(c->fd);
+        if (readset)  FD_CLR(c->fd, readset);
+        if (writeset) FD_CLR(c->fd, writeset);
     }
     free_all_clients();
     reset_game();
 }
 
-// ----- Main Function -----
-// ----- Main Function -----
+// ----- Main -----
 int main(int argc, char *argv[]) {
+    progname = argv[0];
+
     int port_arg, seed;
     parse_arguments(argc, argv, &port_arg, &seed, &max_players);
+
     signal(SIGINT, cleanup_and_exit);
     srand(seed);
     reset_game();
 
     listen_fd = create_listening_socket(port_arg);
 
-    max_fd = listen_fd;
-    client_list = NULL;
-    len_client_list = 0;
+    // allocate our fd_sets on the heap
+    readset  = malloc(sizeof(fd_set));
+    writeset = malloc(sizeof(fd_set));
+    if (!readset || !writeset) {
+        perror("malloc");
+        cleanup_and_exit(-1);
+    }
 
-    fd_set tmp_read, tmp_write;
-    FD_ZERO(&readset);
-    FD_ZERO(&writeset);
-    FD_SET(listen_fd, &readset);
+    FD_ZERO(readset);
+    FD_ZERO(writeset);
+    FD_SET(listen_fd, readset);
+
+    max_fd = listen_fd;
 
     while (1) {
-        tmp_read = readset;
-        tmp_write = writeset;
+        fd_set tmp_read  = *readset;
+        fd_set tmp_write = *writeset;
 
-        // Calculate max_fd dynamically
+        // recalc max_fd
         max_fd = listen_fd;
-        for (Client *c = client_list; c != NULL; c = c->next) {
+        for (Client *c = client_list; c; c = c->next)
             if (c->fd > max_fd) max_fd = c->fd;
-        }
 
-        int activity = select(max_fd + 1, &tmp_read, &tmp_write, NULL, NULL);
-        if (activity < 0 && errno != EINTR) {
+        int ready = select(max_fd + 1, &tmp_read, &tmp_write, NULL, NULL);
+        if (ready < 0 && errno != EINTR) {
             perror("select");
             cleanup_and_exit(-1);
         }
@@ -420,33 +379,30 @@ int main(int argc, char *argv[]) {
         }
 
         Client *cur = client_list;
-        while (cur != NULL) {
-            Client *next_client = cur->next;
+        while (cur) {
+            Client *next = cur->next;
 
             if (cur->fd > 0 && FD_ISSET(cur->fd, &tmp_write)) {
-                printf("Server is ready to write to player %d on socket %d\n", cur->id, cur->fd);
+                printf("Server is ready to write to player %d on socket %d\n",
+                       cur->id, cur->fd);
                 write_to_client(&cur);
             }
-
-            if (cur && cur->fd > 0 && FD_ISSET(cur->fd, &tmp_read)) {
-                printf("Server is ready to read from player %d on socket %d\n", cur->id, cur->fd);
+            if (cur->fd > 0 && FD_ISSET(cur->fd, &tmp_read)) {
+                printf("Server is ready to read from player %d on socket %d\n",
+                       cur->id, cur->fd);
                 read_from_client(&cur);
             }
 
-            cur = next_client;
+            cur = next;
         }
 
-        check_if_all_messages_sent(&readset, &writeset);
+        check_if_all_messages_sent();
 
-        // Manage listening socket FD
-        if (len_client_list >= max_players) {
-            FD_CLR(listen_fd, &readset);
-        } else {
-            FD_SET(listen_fd, &readset);
-        }
-
-        if (game_over && len_client_list == 0) {
-            reset_game();
-        }
+        if (len_client_list >= max_players)
+            FD_CLR(listen_fd, readset);
+        else
+            FD_SET(listen_fd, readset);
     }
+
+    return 0;
 }
